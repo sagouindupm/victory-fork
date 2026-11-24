@@ -171,6 +171,11 @@ Upscaler: the title uses AMD's FidelityFX upscaler (FSR) on Series S. Point
 (2.x) to answer its calls with the PC upscaler for D3D12 instead of the
 console's, which only has 1080p tables.
 
+On an NVIDIA RTX GPU, point `VICTORY_DLSS_DIR` at `bind` of NVIDIA's
+public [Streamline SDK](https://github.com/NVIDIA-RTX/Streamline) (2.x)
+instead: the same calls are answered by DLSS. The title still asks for
+FSR's jitter sequence and render sizes, and gets FSR's answers.
+
 ## Commands
 
 ```
