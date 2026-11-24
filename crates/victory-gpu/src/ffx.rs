@@ -12,6 +12,10 @@
 //! command list for the host list behind the title's, and every texture for
 //! its host copy, moved to the state the upscaler reads (inputs) or writes
 //! (output) on entry. The PC upscaler leaves them in those states.
+//!
+//! With `VICTORY_DLSS_DIR` set instead, NVIDIA DLSS answers the same calls
+//! through Streamline (`dlss`); the swap of the title's objects for the
+//! host's is shared.
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
@@ -23,6 +27,7 @@ use windows::core::{Interface, PCSTR, PCWSTR};
 
 use crate::object::This;
 
+pub(crate) mod dlss;
 pub(crate) mod rgb9e5;
 
 type ReturnCode = u32;
@@ -135,9 +140,10 @@ struct Api {
     dispatch: Dispatch,
 }
 
-/// Whether the title's FidelityFX calls come here: `VICTORY_FFX_DIR` set.
+/// Whether the title's FidelityFX calls come here: `VICTORY_FFX_DIR` or
+/// `VICTORY_DLSS_DIR` set.
 pub fn enabled() -> bool {
-    std::env::var_os("VICTORY_FFX_DIR").is_some()
+    std::env::var_os("VICTORY_FFX_DIR").is_some() || dlss::enabled()
 }
 
 /// AMD's loader, loaded on first use. The upscaler it picks is loaded by
@@ -228,7 +234,7 @@ pub extern "C" fn ffxCreateContext(
     desc: *mut Header,
     _memory: *const c_void,
 ) -> ReturnCode {
-    let (Some(api), Some(device)) = (api(), host_device()) else {
+    let Some(device) = host_device() else {
         return ERROR;
     };
     if context.is_null() || desc.is_null() {
@@ -238,6 +244,10 @@ pub extern "C" fn ffxCreateContext(
     let Some(mut upscale) = (unsafe { upscale_in(desc) }) else {
         return ERROR_PARAMETER;
     };
+    if dlss::enabled() {
+        return dlss::create(context, device, &upscale);
+    }
+    let Some(api) = api() else { return ERROR };
     // The console's version and provider descriptions name console builds;
     // the PC loader picks the newest upscaler the GPU runs.
     let mut dx12 = BackendDx12 {
@@ -294,31 +304,44 @@ pub extern "C" fn ffxDestroyContext(
     context: *mut *mut c_void,
     _memory: *const c_void,
 ) -> ReturnCode {
+    if dlss::enabled() {
+        return dlss::destroy(context);
+    }
     let Some(api) = api() else { return ERROR };
     // SAFETY: a context this module created.
     unsafe { (api.destroy)(context, std::ptr::null()) }
 }
 
 pub extern "C" fn ffxConfigure(context: *mut *mut c_void, desc: *const Header) -> ReturnCode {
-    let Some(api) = api() else { return ERROR };
     if !desc.is_null() {
         // SAFETY: the title's description.
         note("ffxConfigure", unsafe { (*desc).kind });
     }
+    // FSR's key-value tuning has no DLSS counterpart.
+    if dlss::enabled() {
+        return OK;
+    }
+    let Some(api) = api() else { return ERROR };
     // SAFETY: passed on as the title made it.
     unsafe { (api.configure)(context, desc) }
 }
 
 pub extern "C" fn ffxQuery(context: *mut *mut c_void, desc: *mut Header) -> ReturnCode {
-    let (Some(api), Some(device)) = (api(), host_device()) else {
-        return ERROR;
-    };
     if desc.is_null() {
         return ERROR_PARAMETER;
     }
     // SAFETY: the title's description.
     let kind = unsafe { (*desc).kind };
     note("ffxQuery", kind);
+    if dlss::enabled() {
+        // SAFETY: the title's description of the type its header names.
+        let r = unsafe { dlss::query(desc) }.unwrap_or(ERROR_PARAMETER);
+        log_query(kind, desc, r);
+        return r;
+    }
+    let (Some(api), Some(device)) = (api(), host_device()) else {
+        return ERROR;
+    };
     if kind == QUERY_GET_VERSIONS {
         // It names the device to enumerate for: the host's.
         // SAFETY: a description of this type.
@@ -394,7 +417,12 @@ fn log_query(kind: u64, desc: *mut Header, r: ReturnCode) {
 }
 
 pub extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *const Header) -> ReturnCode {
-    let Some(api) = api() else { return ERROR };
+    let fsr = if dlss::enabled() {
+        None
+    } else {
+        let Some(api) = api() else { return ERROR };
+        Some(api)
+    };
     if context.is_null() || desc.is_null() {
         return ERROR_PARAMETER;
     }
@@ -466,8 +494,11 @@ pub extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *const Header) ->
         return ERROR_PARAMETER;
     }
     d.command_list = list.list.as_raw();
-    // SAFETY: the SDK's call on an open host list with live textures.
-    let r = unsafe { (api.dispatch)(context, (&raw const d).cast()) };
+    let r = match fsr {
+        // SAFETY: the SDK's call on an open host list with live textures.
+        Some(api) => unsafe { (api.dispatch)(context, (&raw const d).cast()) },
+        None => dlss::dispatch(context, &d),
+    };
     if r == OK {
         if let Some(packed) = packed_output {
             packed.copy_to(list, output, destination);

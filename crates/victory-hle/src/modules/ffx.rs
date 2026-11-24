@@ -11,6 +11,8 @@
 //!
 //! With `VICTORY_FFX_DIR` set none of that applies: both FidelityFX DLLs are
 //! served by AMD's PC upscaler on the host GPU (`victory_gpu::ffx`, [`module`]).
+//! With `VICTORY_DLSS_DIR` set they are answered by NVIDIA DLSS through
+//! Streamline instead.
 //!
 //! The structures are the public FidelityFX API's (`ffx_api.h`,
 //! `ffx_upscale.h`): a header of a type and a next pointer, and resources of
