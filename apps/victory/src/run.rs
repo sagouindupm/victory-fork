@@ -115,7 +115,8 @@ pub fn run(
             dll: &str,
             symbol: &victory_pe::ImportSymbol,
         ) -> victory_loader::Resolution {
-            let ours = dll.eq_ignore_ascii_case(victory_hle::modules::ffx::LOADER)
+            let ours = !victory_hle::modules::ffx::pc_upscaler()
+                && dll.eq_ignore_ascii_case(victory_hle::modules::ffx::LOADER)
                 && matches!(symbol, victory_pe::ImportSymbol::Name { name, .. } if name == "ffxDispatch");
             if ours {
                 return victory_loader::Resolution::Found {
@@ -163,6 +164,8 @@ fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) 
     victory_loader::dump_stacks_on_schedule();
     victory_hle::modules::audio::capture::start();
     watch(image.base(), image.info().size_of_image as usize);
+    upscaler_override(image);
+    ffx_scale(image);
     // Debugging aid: `VICTORY_CRASH_SAVE=<rva>:<len>,...` (hex) writes those
     // title ranges to `crash-<rva>.bin` in the cache dir on a crash.
     let size = image.info().size_of_image as usize;
@@ -180,6 +183,137 @@ fn diagnostics(image: &victory_loader::LoadedImage, cfg: &victory_core::Config) 
             })
             .collect(),
     );
+}
+
+/// Debugging aid: `VICTORY_UPSCALER=<rva>[,<kind>]` (hex rva, decimal kind,
+/// default 7) makes the title's upscaler picker return `kind`. In 1.0.2.1 the
+/// picker is at 7E93F0 and reached by 4 direct calls; it returns 7 (AMD FSR)
+/// only on Series S and 6 (the title's own upscaler) otherwise. The count of
+/// direct calls and jumps to the rva is logged; with none it is the wrong rva
+/// for this executable and nothing is patched.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn upscaler_override(image: &victory_loader::LoadedImage) {
+    use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
+    const IMAGE_SCN_MEM_EXECUTE: u32 = 0x2000_0000;
+    let Ok(spec) = std::env::var("VICTORY_UPSCALER") else {
+        return;
+    };
+    let (rva, kind) = spec.split_once(',').unwrap_or((&spec, "7"));
+    let rva = usize::from_str_radix(rva.trim().trim_start_matches("0x"), 16);
+    let (Ok(rva), Ok(kind)) = (rva, kind.trim().parse::<u32>()) else {
+        eprintln!("VIctory: VICTORY_UPSCALER={spec}: expected <hex rva>[,<kind>]");
+        return;
+    };
+    let base = image.base();
+    let mut calls = 0;
+    for s in &image.info().sections {
+        if s.characteristics & IMAGE_SCN_MEM_EXECUTE == 0 {
+            continue;
+        }
+        let start = s.rva as usize;
+        // SAFETY: an executable section of the mapped image, readable.
+        let code = unsafe {
+            std::slice::from_raw_parts((base + start) as *const u8, s.virtual_size as usize)
+        };
+        for (i, w) in code.windows(5).enumerate() {
+            let rel = i64::from(i32::from_le_bytes([w[1], w[2], w[3], w[4]]));
+            if matches!(w[0], 0xE8 | 0xE9) && (start + i + 5) as i64 + rel == rva as i64 {
+                calls += 1;
+            }
+        }
+    }
+    if calls == 0 || rva + 6 > image.info().size_of_image as usize {
+        eprintln!(
+            "VIctory: upscaler picker at title+{rva:#x} not patched: no direct call to it (wrong rva?)"
+        );
+        return;
+    }
+    let mut stub = [0xB8, 0, 0, 0, 0, 0xC3]; // mov eax, kind; ret
+    stub[1..5].copy_from_slice(&kind.to_le_bytes());
+    let at = (base + rva) as *mut u8;
+    let mut old = 0;
+    // SAFETY: six bytes at a function entry inside the image; no title code
+    // runs yet.
+    unsafe {
+        VirtualProtect(at.cast(), stub.len(), PAGE_EXECUTE_READWRITE, &mut old);
+        at.copy_from_nonoverlapping(stub.as_ptr(), stub.len());
+        VirtualProtect(at.cast(), stub.len(), old, &mut old);
+    }
+    eprintln!("VIctory: upscaler picker at title+{rva:#x} returns {kind} ({calls} direct calls)");
+}
+
+/// Debugging aid: `VICTORY_FFX_SCALE=<scale>[,<hex rva>]` sets the render
+/// scale of the title's FidelityFX path (0.5: 1080p for a 4K output, 0.6667:
+/// 1440p). The rva is the method that picks the scale (1.0.2.1: 28EF680, the
+/// default); it takes 2/3 on Series S and 1.0 on Series X, so Series X with
+/// FidelityFX forced on renders at full 4K, which overflows its memory plan.
+/// Both of its scale loads (`vmovss xmm0, [rip+d]`) are pointed at our
+/// constant, kept in the padding after the method; with other code there,
+/// nothing is patched.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn ffx_scale(image: &victory_loader::LoadedImage) {
+    use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
+    let Ok(spec) = std::env::var("VICTORY_FFX_SCALE") else {
+        return;
+    };
+    let (scale, rva) = spec.split_once(',').unwrap_or((&spec, "28EF680"));
+    let scale = scale
+        .trim()
+        .parse::<f32>()
+        .ok()
+        .filter(|s| *s > 0.0 && *s <= 1.0);
+    let rva = usize::from_str_radix(rva.trim().trim_start_matches("0x"), 16).ok();
+    let (Some(scale), Some(rva)) = (scale, rva) else {
+        eprintln!("VIctory: VICTORY_FFX_SCALE={spec}: expected <scale in (0, 1]>[,<hex rva>]");
+        return;
+    };
+    if rva + FFX_SCALE_SPAN > image.info().size_of_image as usize {
+        eprintln!("VIctory: VICTORY_FFX_SCALE: title+{rva:#x} is outside the image");
+        return;
+    }
+    let at = (image.base() + rva) as *mut u8;
+    let mut old = 0;
+    // SAFETY: the method's first bytes and its padding, inside the mapped
+    // image (checked above); no title code runs yet.
+    let patched = unsafe {
+        VirtualProtect(at.cast(), FFX_SCALE_SPAN, PAGE_EXECUTE_READWRITE, &mut old);
+        let patched = patch_ffx_scale(std::slice::from_raw_parts_mut(at, FFX_SCALE_SPAN), scale);
+        VirtualProtect(at.cast(), FFX_SCALE_SPAN, old, &mut old);
+        patched
+    };
+    if patched {
+        eprintln!("VIctory: FidelityFX render scale at title+{rva:#x} set to {scale}");
+    } else {
+        eprintln!(
+            "VIctory: FidelityFX scale not patched: unexpected code at title+{rva:#x} (wrong rva?)"
+        );
+    }
+}
+
+/// The bytes of the scale method `patch_ffx_scale` reads and writes.
+#[cfg(all(windows, feature = "diagnostics"))]
+const FFX_SCALE_SPAN: usize = 0x68;
+
+/// Points both scale loads of the method `code` starts with
+/// (`vmovss xmm0, [rip+d]` at +0x28 and +0x32) at `scale`, written into the
+/// method's padding at +0x64. False, with nothing written, for other code.
+#[cfg(all(windows, feature = "diagnostics"))]
+fn patch_ffx_scale(code: &mut [u8], scale: f32) -> bool {
+    const LOADS: [usize; 2] = [0x28, 0x32];
+    const SLOT: usize = 0x64;
+    const VMOVSS_RIP: [u8; 4] = [0xC5, 0xFA, 0x10, 0x05];
+    if code.len() < FFX_SCALE_SPAN
+        || LOADS.iter().any(|&l| code[l..l + 4] != VMOVSS_RIP)
+        || code[SLOT..SLOT + 4] != [0xCC; 4]
+    {
+        return false;
+    }
+    code[SLOT..SLOT + 4].copy_from_slice(&scale.to_le_bytes());
+    for l in LOADS {
+        let disp = (SLOT - (l + 8)) as i32;
+        code[l + 4..l + 8].copy_from_slice(&disp.to_le_bytes());
+    }
+    true
 }
 
 /// Debugging aid: `VICTORY_WATCH=<rva>,...` (hex) logs the u32 at each
@@ -343,6 +477,28 @@ impl LoaderLock {
 #[cfg(all(test, windows))]
 mod tests {
     use std::sync::{Arc, Mutex};
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn ffx_scale_points_both_loads_at_the_constant() {
+        // Synthetic code: the two loads, filler, and int3 padding.
+        let mut code = vec![0x90u8; super::FFX_SCALE_SPAN];
+        for at in [0x28, 0x32] {
+            code[at..at + 8].copy_from_slice(&[0xC5, 0xFA, 0x10, 0x05, 1, 2, 3, 4]);
+        }
+        code[0x60..].fill(0xCC);
+        assert!(super::patch_ffx_scale(&mut code, 0.5));
+        assert_eq!(code[0x64..0x68], 0.5f32.to_le_bytes());
+        // Each load's next instruction plus its displacement is the constant.
+        for at in [0x28, 0x32] {
+            let disp = i32::from_le_bytes(code[at + 4..at + 8].try_into().unwrap());
+            assert_eq!(at as i32 + 8 + disp, 0x64);
+        }
+        // Already patched, so no padding left: nothing is written again.
+        let before = code.clone();
+        assert!(!super::patch_ffx_scale(&mut code, 0.25));
+        assert_eq!(code, before);
+    }
 
     #[test]
     fn loader_lock_is_reentrant_and_exclusive() {
