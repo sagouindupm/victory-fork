@@ -1108,6 +1108,8 @@ struct Resource {
     /// access, the colour texture shaders write instead ([`Twin`]).
     #[cfg(windows)]
     host: Hosted,
+    #[cfg(windows)]
+    fsr_output: std::sync::OnceLock<Option<Box<crate::ffx::rgb9e5::Output>>>,
 }
 
 /// A title texture's host copy and the state it is in. The title's barriers
@@ -1303,7 +1305,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             .clear
             .as_ref()
             .map_or(std::ptr::null(), |c| std::ptr::from_ref(c).cast::<c_void>());
-        let Some(texture) = host_texture(&r.desc, r.host.state, clear) else {
+        let Some(texture) = host_texture(&r.desc, r.host.state, clear, r.data() as usize) else {
             r.host.refused.store(true, Relaxed);
             return None;
         };
@@ -1605,6 +1607,33 @@ pub(crate) fn host_resource<'a>(
     Some(unsafe { &*std::ptr::from_ref(&host.texture) })
 }
 
+#[cfg(windows)]
+pub(crate) fn rgb9e5_fsr_output(this: This) -> Option<&'static crate::ffx::rgb9e5::Output> {
+    let resource = resource(this);
+    if !resource.desc.rgb9e5_fsr_candidate() {
+        return None;
+    }
+    let texture = host_copy(this)?;
+    resource
+        .fsr_output
+        .get_or_init(|| crate::ffx::rgb9e5::Output::new(&texture.texture).map(Box::new))
+        .as_deref()
+}
+
+#[cfg(windows)]
+impl ResourceDesc {
+    fn rgb9e5_fsr_candidate(&self) -> bool {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R9G9B9E5_SHAREDEXP;
+        self.format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP.0 as u32
+            && self.dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D.0 as u32
+            && self.depth_or_array_size == 1
+            && self.mip_levels == 1
+            && self.sample_count == 1
+            && self.flags & 0xf == 0x5
+    }
+}
+
 /// A title texture's host copy, shared, for a list to hold.
 #[cfg(windows)]
 pub(crate) fn host_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
@@ -1621,8 +1650,10 @@ fn host_texture(
     desc: &ResourceDesc,
     state: u32,
     clear: *const c_void,
+    title_address: usize,
 ) -> Option<windows::Win32::Graphics::Direct3D12::ID3D12Resource> {
     use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R9G9B9E5_SHAREDEXP;
     const PC_FLAGS: u32 = 0xf; // render target, depth, UAV, no shader access
     if desc.dimension == BUFFER {
         return None;
@@ -1675,31 +1706,96 @@ fn host_texture(
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
     };
-    let mut texture: Option<ID3D12Resource> = None;
-    // SAFETY: the description has the host layout (checked size, same
-    // fields); the out pointer is ours.
-    let made = unsafe {
-        host.device.CreateCommittedResource(
-            &heap,
-            D3D12_HEAP_FLAG_NONE,
-            (&raw const d).cast(),
-            D3D12_RESOURCE_STATES(
-                crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32,
-            ),
-            // The same layout: format, then color or depth and stencil.
-            clear_value.as_ref().map(|v| std::ptr::from_ref(v).cast()),
-            &mut texture,
-        )
+    let allocate = |d: &ResourceDesc, clear: Option<&[u32; 5]>| {
+        let mut texture: Option<ID3D12Resource> = None;
+        // SAFETY: the description and clear value have the host layout.
+        unsafe {
+            host.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                std::ptr::from_ref(d).cast(),
+                D3D12_RESOURCE_STATES(
+                    crate::host::legal_for(d.flags, crate::host::texture_state(state)) as i32,
+                ),
+                clear.map(|v| std::ptr::from_ref(v).cast()),
+                &mut texture,
+            )
+        }?;
+        if let Some(t) = &texture {
+            crate::host::name(t, || {
+                format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
+            });
+        }
+        Ok::<_, windows::core::Error>(texture)
     };
-    if let Err(e) = made {
-        tracing::warn!(error = %e, desc = ?d, "no host texture");
-    }
-    if let Some(t) = &texture {
-        crate::host::name(t, || {
-            format!("texture {}x{} f{} flags {:#x}", d.width, d.height, d.format, d.flags)
+    if d.format == DXGI_FORMAT_R9G9B9E5_SHAREDEXP.0 as u32 {
+        static SUPPORT: std::sync::OnceLock<(i32, i32)> = std::sync::OnceLock::new();
+        let (support1, support2) = *SUPPORT.get_or_init(|| {
+            let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+                Format: DXGI_FORMAT_R9G9B9E5_SHAREDEXP,
+                ..Default::default()
+            };
+            // SAFETY: the feature selector matches the initialized structure.
+            let query = unsafe {
+                host.device.CheckFeatureSupport(
+                    D3D12_FEATURE_FORMAT_SUPPORT,
+                    (&raw mut support).cast(),
+                    size_of_val(&support) as u32,
+                )
+            };
+            tracing::info!(
+                result = ?query.map_err(|e| e.code()),
+                rtv = support.Support1.contains(D3D12_FORMAT_SUPPORT1_RENDER_TARGET),
+                typed_uav = support.Support1.contains(D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW),
+                typed_store = support.Support2.contains(D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE),
+                "RGB9E5 host format support"
+            );
+            (support.Support1.0, support.Support2.0)
         });
+        let writable = support1 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 != 0
+            && support1 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0
+            && support2 & D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE.0 != 0;
+        let use_fallback = !writable && desc.rgb9e5_fsr_candidate() && crate::ffx::enabled();
+        // After the first rejection, avoid asking the runtime for a known
+        // unsupported resource on every allocation of the same shape.
+        use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+        static WRITABLE_REJECTED: AtomicBool = AtomicBool::new(false);
+        if !use_fallback || !WRITABLE_REJECTED.load(Relaxed) {
+            match allocate(&d, clear_value.as_ref()) {
+                Ok(texture) => return texture,
+                Err(e) => {
+                    static REPORTED: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
+                    let code = e.code().0;
+                    let mut reported = REPORTED.lock().unwrap_or_else(|e| e.into_inner());
+                    if !reported.contains(&code) {
+                        reported.push(code);
+                        tracing::warn!(hresult = %format_args!("{code:#010x}"), desc = ?d, title_address, "no host RGB9E5 texture with title flags");
+                    }
+                }
+            }
+            if !use_fallback {
+                return None;
+            }
+            WRITABLE_REJECTED.store(true, Relaxed);
+        }
+        d.flags = 0;
+        match allocate(&d, None) {
+            Ok(texture) => texture,
+            Err(e) => {
+                static FAILED: std::sync::Once = std::sync::Once::new();
+                FAILED.call_once(|| tracing::warn!(hresult = ?e.code(), desc = ?d, title_address, "no copyable host RGB9E5 texture"));
+                None
+            }
+        }
+    } else {
+        match allocate(&d, clear_value.as_ref()) {
+            Ok(texture) => texture,
+            Err(e) => {
+                tracing::warn!(error = %e, desc = ?d, "no host texture");
+                None
+            }
+        }
     }
-    texture
 }
 
 /// A texture's console memory and description; `None` for buffers.
@@ -1774,6 +1870,8 @@ fn hand_out_resource(
             gone: std::sync::atomic::AtomicBool::new(false),
             placed: std::sync::atomic::AtomicBool::new(false),
         },
+        #[cfg(windows)]
+        fsr_output: std::sync::OnceLock::new(),
     });
     // The host copy waits for the texture's first use ([`Hosted`]).
     #[cfg(windows)]
