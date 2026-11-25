@@ -165,6 +165,12 @@ title's window has focus:
 | F / H | stick clicks |
 | Esc, Tab | Menu, View |
 
+Upscaler: the title uses AMD's FidelityFX upscaler (FSR) on Series S. Point
+`VICTORY_FFX_DIR` at `Kits\FidelityFX\signedbin` of AMD's public
+[FidelityFX SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK)
+(2.x) to answer its calls with the PC upscaler for D3D12 instead of the
+console's, which only has 1080p tables.
+
 ## Commands
 
 ```
@@ -208,6 +214,8 @@ cargo build --profile diag -p victory --features diagnostics   # target\diag\vic
 | `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
+| `VICTORY_UPSCALER=<rva>[,<kind>]` | the title's upscaler picker returns `kind` (default 7, FidelityFX; 1.0.2.1: `7E93F0`); FidelityFX on Series X |
+| `VICTORY_FFX_SCALE=<scale>[,<rva>]` | render scale of the title's FidelityFX path (`0.6667`: 1440p for 4K, `0.5`: 1080p; 1.0.2.1 default rva `28EF680`); Series X otherwise renders native 4K and overflows its memory plan |
 
 Every build appends crashes and host GPU failures to `crashes.log` in the
 title's data folder.
