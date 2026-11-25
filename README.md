@@ -57,6 +57,7 @@ Speed and memory:
 - Title memory can be opened as a graphics heap so that buffers are used in place instead of copied (`VICTORY_INPLACE`, first stage only; a probe confirmed the approach on the test GPU).
 - The bindless texture queue no longer uploads stale views; the view table no longer grows without bound; the pipeline library is mapped instead of read into memory.
 - An intermittent device loss was traced to the pipeline library file being replaced while mapped; fixed.
+- On 8 GB cards, `VICTORY_TEXTURE_DROP_MIPS=1` leaves out the largest level of the 2D textures the title fills (they keep about a quarter of their bytes), so the textures picked by index fit in the card's memory budget: on an RTX 4060 Ti 8 GB, about 210 ms a frame in the first room instead of about 430, with 6,000 textures waiting instead of 15,000. Off by default.
 
 - Translated shaders get clean-up passes over the finished module (dead code, constant folding, reuse of values, branch facts); the pack's host instruction count falls by about 43 %, worth about 20 ms of GPU time per frame on the test machine (`VICTORY_SHADER_OPT=0` turns them off).
 

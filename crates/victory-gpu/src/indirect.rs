@@ -690,7 +690,7 @@ void main() {
                 warp.list.SetComputeRootShaderResourceView(1, now_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
                 warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
-                warp.list.Dispatch(PIECES.div_ceil(64), 1, 1);
+                warp.list.Dispatch(PIECES, 1, 1);
             }
             warp.submit_and_wait();
             // SAFETY: as above.
@@ -718,6 +718,87 @@ void main() {
         set(content[at]);
         assert_eq!(run(&mut warp, 2), [0, 1, 0]);
         assert_eq!(run(&mut warp, 2), [0, 0, 0]);
+    }
+
+    /// The compare's group of threads splits a piece by 16-byte blocks: a
+    /// byte changed anywhere in it (the first, the last, in every thread's
+    /// share, also with a copy that starts inside its first piece) flags
+    /// that piece and no other, and two blocks swapped are seen as well.
+    #[test]
+    fn warp_card_compare_sees_a_change_in_every_part_of_a_piece() {
+        let Some(mut warp) = WarpHarness::new() else {
+            return;
+        };
+        let compare = compile_cs(&warp.device, crate::host::CARD_COMPARE).expect("the card compare must compile on WARP");
+        const PIECE: usize = 64 << 10;
+        const PIECES: u32 = 3;
+        let size = PIECE * PIECES as usize;
+        let (_now, now_ptr, now_gpu) = warp.shared_buffer(size as u64);
+        let (_hashes, _, hashes_gpu) = warp.shared_buffer(16 * u64::from(PIECES));
+        let (_differs, differs_ptr, differs_gpu) = warp.shared_buffer(64);
+        let content: Vec<u8> = (0..size).map(|i| (i * 131 + i / 97) as u8).collect();
+        // SAFETY: the mapping holds `size` bytes.
+        unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size) };
+        for skew in [0u32, 4096 + 48] {
+            let run = |warp: &mut WarpHarness, mode: u32| -> [u32; 3] {
+                // SAFETY: our open list, live buffers, the compare's own
+                // root signature; the mappings hold what is read and written.
+                unsafe {
+                    for piece in 0..PIECES as usize {
+                        differs_ptr.cast::<u32>().add(piece).write_volatile(7);
+                    }
+                    warp.list.SetComputeRootSignature(&compare.root);
+                    warp.list.SetPipelineState(&compare.pso);
+                    warp.list.SetComputeRootShaderResourceView(1, now_gpu);
+                    warp.list.SetComputeRootUnorderedAccessView(2, hashes_gpu);
+                    warp.list.SetComputeRootUnorderedAccessView(3, differs_gpu);
+                    crate::host::card_compare_dispatch(&warp.list, [0, skew, size as u32, PIECES, 0, mode]);
+                }
+                warp.submit_and_wait();
+                // SAFETY: as above.
+                [0, 1, 2].map(|piece| unsafe { differs_ptr.cast::<u32>().add(piece).read_volatile() })
+            };
+            assert_eq!(run(&mut warp, 0), [7, 7, 7]);
+            assert_eq!(run(&mut warp, 1), [0, 0, 0]);
+            // The middle piece's bytes in the buffer, as the shader cuts it:
+            // its first and last byte, and one in each thread's share.
+            let lo = PIECE - skew as usize;
+            let hi = 2 * PIECE - skew as usize;
+            let spots = [lo, hi - 1]
+                .into_iter()
+                .chain((0..64).map(|lane| lo + lane * 1040 + lane % 16));
+            for at in spots {
+                // SAFETY (both): inside the mapping.
+                unsafe { now_ptr.add(at).write_volatile(content[at] ^ 0x01) };
+                assert_eq!(
+                    run(&mut warp, 1),
+                    [0, 1, 0],
+                    "a change at {at:#x} (skew {skew}) is flagged"
+                );
+                unsafe { now_ptr.add(at).write_volatile(content[at]) };
+                assert_eq!(
+                    run(&mut warp, 1),
+                    [0, 0, 0],
+                    "changed back at {at:#x} (skew {skew})"
+                );
+            }
+            // Two blocks of neighbouring threads swapped: the same bytes in
+            // another order.
+            let (a, b) = (lo + 16, lo + 32);
+            // SAFETY: inside the mapping; put back below.
+            unsafe {
+                std::ptr::copy_nonoverlapping(content[b..b + 16].as_ptr(), now_ptr.add(a), 16);
+                std::ptr::copy_nonoverlapping(content[a..a + 16].as_ptr(), now_ptr.add(b), 16);
+            }
+            assert_eq!(
+                run(&mut warp, 1),
+                [0, 1, 0],
+                "two blocks swapped (skew {skew})"
+            );
+            // SAFETY: as above.
+            unsafe { std::ptr::copy_nonoverlapping(content.as_ptr(), now_ptr, size) };
+            assert_eq!(run(&mut warp, 1), [0, 0, 0]);
+        }
     }
 
     /// The clamp compiles with the system's compiler and the host takes it.
