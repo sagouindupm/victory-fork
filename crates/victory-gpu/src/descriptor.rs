@@ -178,6 +178,7 @@ pub(crate) fn sync_heaps() {
     let started = std::time::Instant::now();
     let (mut pages, mut looked, mut mirrored) = (0u64, 0u64, 0u64);
     let mut page_bytes: Vec<u8> = Vec::new();
+    let mut changed: Vec<u32> = Vec::new();
     let heaps = SHADER_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
     for &(start, end, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
@@ -203,23 +204,17 @@ pub(crate) fn sync_heaps() {
                 if crate::host::read_into(from as *const u8, &mut page_bytes) {
                     pages += 1;
                     let slots = changed_slots(from, to, start as usize, step, mirrored_count);
-                    for index in slots {
-                        let handle = start + index * step;
+                    let bytes = &page_bytes;
+                    let records = slots.filter_map(|index| {
                         // A record that straddles the range's ends is left
                         // to the range that holds its first byte.
-                        let Some(at) = (handle as usize).checked_sub(from) else {
-                            continue;
-                        };
-                        let Some(record) = page_bytes.get(at..at + step as usize) else {
-                            continue;
-                        };
-                        looked += 1;
-                        // Only a record that is not the one last seen there
-                        // (`HostHeap::mirror_copied`).
-                        if host.mirror_copied(index as u32, handle, record) {
-                            mirrored += 1;
-                        }
-                    }
+                        let at = ((start + index * step) as usize).checked_sub(from)?;
+                        Some((index as u32, bytes.get(at..at + step as usize)?))
+                    });
+                    // Only a record that is not the one last seen there, the
+                    // page's slots under one lock (`HostHeap::mirror_copied`).
+                    let records = records.inspect(|_| looked += 1);
+                    mirrored += host.mirror_copied(records, |index| start + u64::from(index) * step, &mut changed);
                 }
                 page += crate::watch::PAGE;
             }
