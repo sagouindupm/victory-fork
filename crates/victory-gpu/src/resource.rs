@@ -296,6 +296,16 @@ pub(crate) fn target_format(format: u32) -> u32 {
 /// Whether the host copy of the title texture `this` is in a stand-in
 /// format ([`target_format`]): its texels are not laid out as the title's.
 #[cfg(windows)]
+pub(crate) fn extent_of(this: This) -> (u64, u32) {
+    if this.is_null() {
+        return (0, 0);
+    }
+    let r = resource(this);
+    (r.desc.width, r.desc.height)
+}
+
+/// Whether the host copy of `this` is in a stand-in format.
+#[cfg(windows)]
 pub(crate) fn stands_in(this: This) -> bool {
     if this.is_null() {
         return false;
