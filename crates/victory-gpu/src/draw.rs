@@ -843,8 +843,55 @@ impl State {
         self.prepare_for(list, indexed, false)
     }
 
+    /// Experiment (`VICTORY_LITE`): counts draws by the kind of pass they
+    /// are in (colour targets, size of the depth target) and logs the
+    /// counts every 64 frames; with `VICTORY_LITE=<w>x<h>[,<w>x<h>…]` the
+    /// draws with no colour target into a depth target of one of those
+    /// sizes are dropped (true).
+    fn lite(&self) -> bool {
+        type Kinds = std::collections::BTreeMap<(usize, u64, u32), u64>;
+        static CENSUS: std::sync::Mutex<(u64, Kinds)> = std::sync::Mutex::new((0, Kinds::new()));
+        static DROP: std::sync::OnceLock<Option<Vec<(u64, u32)>>> = std::sync::OnceLock::new();
+        let drop = DROP.get_or_init(|| {
+            let v = std::env::var("VICTORY_LITE").ok()?;
+            Some(
+                v.split(',')
+                    .filter_map(|s| {
+                        let (w, h) = s.trim().split_once('x')?;
+                        Some((w.parse().ok()?, h.parse().ok()?))
+                    })
+                    .collect(),
+            )
+        });
+        let Some(drop) = drop else {
+            return false;
+        };
+        let (w, h) = crate::resource::extent_of(self.depth as This);
+        let kind = (self.targets.len(), w, h);
+        let frame = crate::frame::current();
+        {
+            let mut census = CENSUS.lock().unwrap_or_else(|e| e.into_inner());
+            *census.1.entry(kind).or_insert(0) += 1;
+            if frame >= census.0 + 64 {
+                let frames = (frame - census.0) as f64;
+                let kinds: Vec<String> = census
+                    .1
+                    .iter()
+                    .map(|((targets, w, h), n)| format!("{targets} colour, depth {w}x{h}: {:.0}", *n as f64 / frames))
+                    .collect();
+                tracing::info!(kinds = ?kinds, "lite census: draws per frame by pass kind");
+                census.1.clear();
+                census.0 = frame;
+            }
+        }
+        self.targets.is_empty() && drop.contains(&(w, h))
+    }
+
     /// As [`State::prepare`], for draws (`mesh` false) or mesh dispatches.
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
+        if self.lite() {
+            return false;
+        }
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return false;
