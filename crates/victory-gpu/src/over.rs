@@ -22,7 +22,6 @@ use windows::Win32::Graphics::Direct3D12::*;
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
 
 const SOURCE: &str = r#"
-#define RS "DescriptorTable(SRV(t0), visibility = SHADER_VISIBILITY_PIXEL), StaticSampler(s0, filter = FILTER_MIN_MAG_LINEAR_MIP_POINT, addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP, visibility = SHADER_VISIBILITY_PIXEL)"
 Texture2D<float4> plane : register(t0);
 SamplerState bilinear : register(s0);
 struct Corner { float4 position : SV_Position; float2 at : TEXCOORD0; };
@@ -32,7 +31,6 @@ Corner corner(uint i : SV_VertexID) {
     c.position = float4(c.at.x * 2.0 - 1.0, 1.0 - c.at.y * 2.0, 0.0, 1.0);
     return c;
 }
-[RootSignature(RS)]
 float4 over(Corner c) : SV_Target { return plane.Sample(bilinear, c.at); }
 "#;
 
@@ -61,6 +59,79 @@ unsafe impl Send for Pass {}
 
 static PASS: Mutex<Option<Pass>> = Mutex::new(None);
 
+/// A bilinear, clamping sampler at `s0` for the stages `visibility` names.
+fn bilinear(visibility: D3D12_SHADER_VISIBILITY) -> D3D12_STATIC_SAMPLER_DESC {
+    D3D12_STATIC_SAMPLER_DESC {
+        Filter: D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT,
+        AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
+        ComparisonFunc: D3D12_COMPARISON_FUNC_NEVER,
+        MaxLOD: f32::MAX,
+        ShaderRegister: 0,
+        RegisterSpace: 0,
+        ShaderVisibility: visibility,
+        ..Default::default()
+    }
+}
+
+/// A root signature of `parameters` and one bilinear sampler, serialized by
+/// the runtime and not taken from a shader: the system compiler under Wine
+/// compiles a `[RootSignature]` attribute without writing the signature
+/// into the shader, and `CreateRootSignature` then fails on it (#188).
+fn root_signature(
+    device: &ID3D12Device,
+    parameters: &[D3D12_ROOT_PARAMETER],
+    sampler: D3D12_SHADER_VISIBILITY,
+    flags: D3D12_ROOT_SIGNATURE_FLAGS,
+) -> windows::core::Result<ID3D12RootSignature> {
+    use windows::Win32::Graphics::Direct3D::ID3DBlob;
+    let samplers = [bilinear(sampler)];
+    let desc = D3D12_ROOT_SIGNATURE_DESC {
+        NumParameters: parameters.len() as u32,
+        pParameters: parameters.as_ptr(),
+        NumStaticSamplers: 1,
+        pStaticSamplers: samplers.as_ptr(),
+        Flags: flags,
+    };
+    let mut blob: Option<ID3DBlob> = None;
+    // SAFETY: the description points at live slices; the blob is the
+    // runtime's own, read while it lives.
+    unsafe {
+        D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut blob, None)?;
+        let blob = blob.ok_or_else(windows::core::Error::empty)?;
+        let bytes =
+            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
+        device.CreateRootSignature(0, bytes)
+    }
+}
+
+/// One descriptor range of one view at register 0, at `offset` in its table.
+fn range(kind: D3D12_DESCRIPTOR_RANGE_TYPE, offset: u32) -> D3D12_DESCRIPTOR_RANGE {
+    D3D12_DESCRIPTOR_RANGE {
+        RangeType: kind,
+        NumDescriptors: 1,
+        BaseShaderRegister: 0,
+        RegisterSpace: 0,
+        OffsetInDescriptorsFromTableStart: offset,
+    }
+}
+
+/// A root parameter that is a table of `ranges`, for the stages `visibility`
+/// names.
+fn table(ranges: &[D3D12_DESCRIPTOR_RANGE], visibility: D3D12_SHADER_VISIBILITY) -> D3D12_ROOT_PARAMETER {
+    D3D12_ROOT_PARAMETER {
+        ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
+        Anonymous: D3D12_ROOT_PARAMETER_0 {
+            DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
+                NumDescriptorRanges: ranges.len() as u32,
+                pDescriptorRanges: ranges.as_ptr(),
+            },
+        },
+        ShaderVisibility: visibility,
+    }
+}
+
 fn make(device: &ID3D12Device, format: DXGI_FORMAT) -> windows::core::Result<Pass> {
     use windows::core::s;
     let vs = crate::host::compile(SOURCE, s!("corner"), s!("vs_5_1"))?;
@@ -69,10 +140,16 @@ fn make(device: &ID3D12Device, format: DXGI_FORMAT) -> windows::core::Result<Pas
         pShaderBytecode: bytes.as_ptr().cast(),
         BytecodeLength: bytes.len(),
     };
-    // SAFETY: the root signature is inside the pixel shader; the description
-    // points at live data and never releases its pointer.
+    let plane = [range(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 0)];
+    let root = root_signature(
+        device,
+        &[table(&plane, D3D12_SHADER_VISIBILITY_PIXEL)],
+        D3D12_SHADER_VISIBILITY_PIXEL,
+        D3D12_ROOT_SIGNATURE_FLAG_NONE,
+    )?;
+    // SAFETY: the description points at live data and never releases its
+    // pointer.
     unsafe {
-        let root: ID3D12RootSignature = device.CreateRootSignature(0, &ps[..])?;
         let mut desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
             VS: code(&vs[..]),
@@ -240,12 +317,10 @@ pub(crate) fn record(
 /// shortcut: no temporal accumulation, sharpening or use of the depth and
 /// motion inputs: an image, not the upscaler's quality.
 const STRETCH: &str = r#"
-#define RS "RootConstants(num32BitConstants = 4, b0), DescriptorTable(SRV(t0), UAV(u0)), StaticSampler(s0, filter = FILTER_MIN_MAG_LINEAR_MIP_POINT, addressU = TEXTURE_ADDRESS_CLAMP, addressV = TEXTURE_ADDRESS_CLAMP)"
 cbuffer Sizes : register(b0) { float2 scale; float2 texel; };
 Texture2D<float4> source : register(t0);
 RWTexture2D<float4> target : register(u0);
 SamplerState bilinear : register(s0);
-[RootSignature(RS)]
 [numthreads(8, 8, 1)]
 void stretch(uint3 id : SV_DispatchThreadID) {
     // Groups are 8 by 8: the last ones reach past a size that is not a
@@ -281,10 +356,30 @@ const STRETCH_RING: u32 = 64;
 fn make_stretch(device: &ID3D12Device) -> windows::core::Result<Stretch> {
     use windows::core::s;
     let cs = crate::host::compile(STRETCH, s!("stretch"), s!("cs_5_1"))?;
-    // SAFETY: the root signature is inside the shader; the description
-    // points at live data and never releases its pointer.
+    let views = [
+        range(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 0),
+        range(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1),
+    ];
+    let sizes = D3D12_ROOT_PARAMETER {
+        ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
+        Anonymous: D3D12_ROOT_PARAMETER_0 {
+            Constants: D3D12_ROOT_CONSTANTS {
+                ShaderRegister: 0,
+                RegisterSpace: 0,
+                Num32BitValues: 4,
+            },
+        },
+        ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
+    };
+    let root = root_signature(
+        device,
+        &[sizes, table(&views, D3D12_SHADER_VISIBILITY_ALL)],
+        D3D12_SHADER_VISIBILITY_ALL,
+        D3D12_ROOT_SIGNATURE_FLAG_NONE,
+    )?;
+    // SAFETY: the description points at live data and never releases its
+    // pointer.
     unsafe {
-        let root: ID3D12RootSignature = device.CreateRootSignature(0, &cs[..])?;
         let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
             pRootSignature: std::mem::transmute_copy(&root),
             CS: D3D12_SHADER_BYTECODE {
@@ -429,6 +524,16 @@ mod tests {
         // R11G11B10_FLOAT, R8G8B8A8_UNORM_SRGB and the FP16 stand-in's own.
         for format in [26, 29, 10, 0] {
             assert_eq!(typed(DXGI_FORMAT(format)).0, format);
+        }
+    }
+
+    /// The passes' root signatures are serialized by the runtime: neither
+    /// source asks the compiler for one (Wine's writes none).
+    #[test]
+    fn the_sources_carry_no_root_signature() {
+        for source in [SOURCE, STRETCH] {
+            assert!(!source.contains("RootSignature"));
+            assert!(!source.contains("#define RS"));
         }
     }
 
