@@ -329,6 +329,11 @@ void stretch(uint3 id : SV_DispatchThreadID) {
     target.GetDimensions(width, height);
     if (id.x >= width || id.y >= height) return;
     float2 at = (float2(id.xy) + 0.5) * texel * scale;
+    // The rendered size can be the top left of a larger texture: stay half a
+    // texel inside it, or the filter takes in what is beside it.
+    uint sw, sh;
+    source.GetDimensions(sw, sh);
+    at = min(at, scale - 0.5 / float2(sw, sh));
     target[id.xy] = source.SampleLevel(bilinear, at, 0);
 }
 "#;

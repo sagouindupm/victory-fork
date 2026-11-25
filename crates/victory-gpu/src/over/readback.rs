@@ -2,13 +2,16 @@
 
 use super::*;
 
-#[test]
-fn stretch_and_overlay_preserve_the_expected_pixels() {
+/// Stretches a blue 3 by 2 scene to 5 by 3 and reads the result back, `None`
+/// without a device. `padded`: the scene is the top left of a 4 by 3 texture
+/// whose other texels are red, and the interface over it is empty; otherwise
+/// the interface has a half green and a red strip.
+fn stretched(padded: bool) -> Option<[[u8; 20]; 3]> {
     use crate::host::{host, transition};
     use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM as RGBA8;
     let Some(host) = host() else {
         eprintln!("no D3D12 device; skipping display readback");
-        return;
+        return None;
     };
     let texture = |width: u32, height, flags, state| {
         let mut resource: Option<ID3D12Resource> = None;
@@ -70,7 +73,8 @@ fn stretch_and_overlay_preserve_the_expected_pixels() {
     };
     let uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
     let rtv = D3D12_RESOURCE_STATE_RENDER_TARGET;
-    let scene = texture(3, 2, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, rtv);
+    let (width, height) = if padded { (4, 3) } else { (3, 2) };
+    let scene = texture(width, height, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, rtv);
     let ui = texture(5, 3, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, rtv);
     let target = texture(
         5,
@@ -85,7 +89,14 @@ fn stretch_and_overlay_preserve_the_expected_pixels() {
     unsafe {
         let scene_view = host.rtv(Some(&scene), None);
         let ui_view = host.rtv(Some(&ui), None);
-        list.ClearRenderTargetView(scene_view, &[0.0, 0.0, 1.0, 1.0], None);
+        list.ClearRenderTargetView(scene_view, &[1.0, 0.0, 0.0, 1.0], None);
+        let drawn = RECT {
+            left: 0,
+            right: 3,
+            top: 0,
+            bottom: 2,
+        };
+        list.ClearRenderTargetView(scene_view, &[0.0, 0.0, 1.0, 1.0], Some(&[drawn]));
         list.ClearRenderTargetView(ui_view, &[0.0; 4], None);
         let strip = |left, right| RECT {
             left,
@@ -93,12 +104,14 @@ fn stretch_and_overlay_preserve_the_expected_pixels() {
             top: 0,
             bottom: 3,
         };
-        list.ClearRenderTargetView(
-            ui_view,
-            &[0.0, 128.0 / 255.0, 0.0, 128.0 / 255.0],
-            Some(&[strip(2, 3)]),
-        );
-        list.ClearRenderTargetView(ui_view, &[1.0, 0.0, 0.0, 1.0], Some(&[strip(3, 5)]));
+        if !padded {
+            list.ClearRenderTargetView(
+                ui_view,
+                &[0.0, 128.0 / 255.0, 0.0, 128.0 / 255.0],
+                Some(&[strip(2, 3)]),
+            );
+            list.ClearRenderTargetView(ui_view, &[1.0, 0.0, 0.0, 1.0], Some(&[strip(3, 5)]));
+        }
         list.ResourceBarrier(&[
             transition(&scene, rtv, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
             transition(&ui, rtv, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
@@ -132,6 +145,14 @@ fn stretch_and_overlay_preserve_the_expected_pixels() {
         }
         readback.Unmap(0, None);
     }
+    Some(pixels)
+}
+
+#[test]
+fn stretch_and_overlay_preserve_the_expected_pixels() {
+    let Some(pixels) = stretched(false) else {
+        return;
+    };
     let expected = [
         [0, 0, 255, 255],
         [0, 0, 255, 255],
@@ -141,5 +162,17 @@ fn stretch_and_overlay_preserve_the_expected_pixels() {
     ];
     for row in pixels {
         assert_eq!(&row[..], expected.as_flattened());
+    }
+}
+
+/// The title's colour is the top left of a larger texture: what is beside
+/// the rendered size must not be filtered into the right and bottom edges.
+#[test]
+fn stretch_does_not_filter_in_what_is_beside_the_rendered_size() {
+    let Some(pixels) = stretched(true) else {
+        return;
+    };
+    for row in pixels {
+        assert_eq!(&row[..], [[0u8, 0, 255, 255]; 5].as_flattened());
     }
 }
